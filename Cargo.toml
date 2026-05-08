@@ -15,11 +15,11 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
-google-drive3 = "7.0.0+20251218"
+google-drive3 = { version = "7.0.0+20251218", default-features = false, features = ["yup-oauth2", "ring"] }
 http-body = "1"
 http-body-util = "0.1"
 hyper = "1"
-hyper-rustls = "0.27"
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring"] }
 hyper-util = "0.1"
 md5 = "0.7"
 mime = "0.3"
