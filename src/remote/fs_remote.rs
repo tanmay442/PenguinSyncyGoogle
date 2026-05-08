@@ -97,14 +97,19 @@ impl FsRemoteStore {
     }
 }
 
+#[async_trait::async_trait]
 impl RemoteStore for FsRemoteStore {
-    fn ensure_sandbox(&self) -> Result<()> {
+    async fn ensure_sandbox(&self) -> Result<()> {
         fs::create_dir_all(&self.sandbox_root)
             .with_context(|| format!("failed to create {}", self.sandbox_root.display()))?;
         Ok(())
     }
 
-    fn upload_or_update(&self, virtual_path: &str, local_path: &Path) -> Result<RemoteFileMeta> {
+    async fn upload_or_update(
+        &self,
+        virtual_path: &str,
+        local_path: &Path,
+    ) -> Result<RemoteFileMeta> {
         if !local_path.exists() {
             bail!("local path does not exist: {}", local_path.display());
         }
@@ -135,7 +140,11 @@ impl RemoteStore for FsRemoteStore {
             .context("metadata not available after upload")
     }
 
-    fn download_to_local(&self, virtual_path: &str, local_path: &Path) -> Result<RemoteFileMeta> {
+    async fn download_to_local(
+        &self,
+        virtual_path: &str,
+        local_path: &Path,
+    ) -> Result<RemoteFileMeta> {
         let normalized = normalize_remote_path(virtual_path);
         let source = self.absolute_from_virtual(&normalized)?;
 
@@ -163,7 +172,11 @@ impl RemoteStore for FsRemoteStore {
             .context("metadata not available after download")
     }
 
-    fn rename(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<RemoteFileMeta> {
+    async fn rename(
+        &self,
+        from_virtual_path: &str,
+        to_virtual_path: &str,
+    ) -> Result<RemoteFileMeta> {
         let from_normalized = normalize_remote_path(from_virtual_path);
         let to_normalized = normalize_remote_path(to_virtual_path);
 
@@ -191,7 +204,7 @@ impl RemoteStore for FsRemoteStore {
             .context("metadata not available after rename")
     }
 
-    fn trash(&self, virtual_path: &str) -> Result<()> {
+    async fn trash(&self, virtual_path: &str) -> Result<()> {
         let normalized = normalize_remote_path(virtual_path);
         let source = self.absolute_from_virtual(&normalized)?;
 
@@ -223,7 +236,7 @@ impl RemoteStore for FsRemoteStore {
         Ok(())
     }
 
-    fn poll_changes(&self) -> Result<Vec<RemoteChange>> {
+    async fn poll_changes(&self) -> Result<Vec<RemoteChange>> {
         let current = self.scan_files()?;
 
         let mut snapshot = self
@@ -257,7 +270,7 @@ impl RemoteStore for FsRemoteStore {
         Ok(changes)
     }
 
-    fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
+    async fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
         self.metadata_for_virtual(virtual_path)
     }
 }
