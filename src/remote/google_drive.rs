@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use google_drive3::api::{Change, File as DriveFile};
+use google_drive3::api::{Change, File as DriveFile, Scope};
 use google_drive3::{DriveHub, Error as DriveError, common, hyper, hyper_rustls, hyper_util, yup_oauth2};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File as StdFile};
@@ -74,6 +74,9 @@ impl GoogleDriveRemoteStore {
             )
         })?;
 
+        debug!("OAuth authenticator initialized with default scopes");
+        debug!("Note: list operations default scope may be restricted; operations will use .add_scope(Scope::Full) where needed");
+
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
             .context("failed to load native TLS root certificates")?
@@ -85,6 +88,11 @@ impl GoogleDriveRemoteStore {
             .build(connector);
 
         let hub = DriveHub::new(client, auth);
+
+        debug!("GoogleDriveRemoteStore initialized with scopes:");
+        debug!("  - list/query operations use default scope");
+        debug!("  - upload/update operations add drive scope");
+        debug!("  - all operations use supportsAllDrives=true, includeItemsFromAllDrives=true");
 
         Ok(Self {
             hub,
@@ -161,6 +169,8 @@ impl GoogleDriveRemoteStore {
             escaped_name, escaped_parent
         );
 
+        debug!("Drive query: q=\"{}\" parent={}", query, parent_id);
+
         if let Some(mime_type) = exact_mime_type {
             query.push_str(&format!(
                 " and mimeType = '{}'",
@@ -168,31 +178,54 @@ impl GoogleDriveRemoteStore {
             ));
         }
 
-        if let Some(mime_type) = exclude_mime_type {
+        if let Some(exclude) = exclude_mime_type {
             query.push_str(&format!(
-                " and mimeType != '{}'",
-                escape_drive_query_literal(mime_type)
+                " and not mimeType = '{}'",
+                escape_drive_query_literal(exclude)
             ));
         }
 
-        let (_, list) = self
+        let result = self
             .hub
             .files()
             .list()
+            .add_scope(Scope::Full)
             .q(&query)
             .spaces("drive")
             .supports_all_drives(true)
             .include_items_from_all_drives(true)
             .page_size(10)
-            .param("fields", DRIVE_FILE_LIST_FIELDS)
+            .param("fields", "files(id,name,parents,mimeType)")
             .doit()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to list Drive children for parent {} and name '{}'",
-                    parent_id, name
-                )
-            })?;
+            .await;
+
+        let list = match result {
+            Ok((_, list)) => list,
+            Err(err) => {
+                let code = error_status_code(&err);
+                if code == Some(400) {
+                    warn!(
+                        "Drive API returned 400 Bad Request for query: q={}, parent={}",
+                        query, parent_id
+                    );
+                    return Ok(None);
+                }
+                return Err(anyhow!(
+                    "failed to list Drive children for parent {} and name '{}': {}",
+                    parent_id,
+                    name,
+                    err
+                ));
+            }
+        };
+
+        debug!("find_child '{}' in parent {} -> {} files", name, parent_id, list.files.as_ref().map(|f| f.len()).unwrap_or(0));
+        debug!("  -> raw list object: {:?}", serde_json::to_string(&list).unwrap_or_default());
+        if let Some(ref files) = list.files {
+            for f in files {
+                debug!("  -> found file: id={:?}, name={:?}, mimeType={:?}", f.id, f.name, f.mime_type);
+            }
+        }
 
         Ok(list.files.and_then(|mut files| files.drain(..).next()))
     }
@@ -512,6 +545,11 @@ impl RemoteStore for GoogleDriveRemoteStore {
         let existing = self
             .find_child(&parent_id, &file_name, None, Some(FOLDER_MIME_TYPE))
             .await?;
+
+        debug!(
+            "upload_or_update '{}' -> parent_id={}, file_name='{}', existing={:?}",
+            normalized, parent_id, file_name, existing.as_ref().map(|f| f.id.as_ref())
+        );
 
         let uploaded_file = if let Some(existing) = existing {
             let file_id = existing
@@ -857,7 +895,7 @@ fn split_parent_and_file_name(raw: &str) -> Result<(Vec<String>, String)> {
 }
 
 fn escape_drive_query_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
+    value.replace('\\', "\\\\").replace('\'', "''")
 }
 
 fn error_status_code(err: &DriveError) -> Option<u16> {
