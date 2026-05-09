@@ -27,7 +27,7 @@ pub async fn run_remote_poller(
                 break;
             }
             _ = interval.tick() => {
-                match remote.poll_changes().await {
+                match remote.poll_changes() {
                     Ok(changes) => {
                         for change in changes {
                             if tx.send(SyncEvent::Remote(change)).await.is_err() {

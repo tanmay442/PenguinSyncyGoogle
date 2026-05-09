@@ -43,11 +43,6 @@ impl StateDb {
                 remote_timestamp TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS sync_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
             CREATE UNIQUE INDEX IF NOT EXISTS idx_file_state_remote
             ON file_state(virtual_remote_path);
 
@@ -188,31 +183,6 @@ impl StateDb {
         self.conn.execute(
             "UPDATE file_state SET local_timestamp = ?2 WHERE local_path = ?1",
             params![normalize_local_path(local_path), local_timestamp],
-        )?;
-
-        Ok(())
-    }
-
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT value FROM sync_meta WHERE key = ?1")?;
-
-        let value = stmt
-            .query_row(params![key], |row| row.get(0))
-            .optional()?;
-
-        Ok(value)
-    }
-
-    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO sync_meta (key, value)
-            VALUES (?1, ?2)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            "#,
-            params![key, value],
         )?;
 
         Ok(())

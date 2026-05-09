@@ -53,7 +53,7 @@ impl SyncEngine {
         loop {
             tokio::select! {
                 _ = cleanup_tick.tick() => {
-                    if let Err(err) = self.flush_expired_pending_deletes().await {
+                    if let Err(err) = self.flush_expired_pending_deletes() {
                         error!("failed to flush pending deletes: {err:#}");
                     }
                 }
@@ -61,7 +61,7 @@ impl SyncEngine {
                     match maybe {
                         Some(SyncEvent::Shutdown) => {
                             info!("sync engine received shutdown event");
-                            self.flush_all_pending_deletes().await?;
+                            self.flush_all_pending_deletes()?;
                             break;
                         }
                         Some(event) => {
@@ -71,7 +71,7 @@ impl SyncEngine {
                         }
                         None => {
                             info!("sync event channel closed");
-                            self.flush_all_pending_deletes().await?;
+                            self.flush_all_pending_deletes()?;
                             break;
                         }
                     }
@@ -94,14 +94,14 @@ impl SyncEngine {
     async fn handle_local_event(&mut self, event: LocalFileEvent) -> Result<()> {
         match event.kind {
             LocalFileEventKind::Upsert => self.handle_local_upsert(event.path).await,
-            LocalFileEventKind::Delete => self.handle_local_delete(event.path).await,
+            LocalFileEventKind::Delete => self.handle_local_delete(event.path),
         }
     }
 
     async fn handle_remote_event(&mut self, event: RemoteChange) -> Result<()> {
         match event {
             RemoteChange::Upsert(meta) => self.handle_remote_upsert(meta.virtual_path).await,
-            RemoteChange::Delete { virtual_path } => self.handle_remote_delete(virtual_path).await,
+            RemoteChange::Delete { virtual_path } => self.handle_remote_delete(virtual_path),
         }
     }
 
@@ -133,7 +133,6 @@ impl SyncEngine {
             let renamed_meta = match self
                 .remote
                 .rename(&pending_delete.record.virtual_remote_path, &virtual_path)
-                .await
             {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -141,7 +140,7 @@ impl SyncEngine {
                         "remote rename failed ({} -> {}), falling back to upload: {err:#}",
                         pending_delete.record.virtual_remote_path, virtual_path
                     );
-                    self.remote.upload_or_update(&virtual_path, &path).await?
+                    self.remote.upload_or_update(&virtual_path, &path)?
                 }
             };
 
@@ -173,7 +172,7 @@ impl SyncEngine {
             return Ok(());
         }
 
-        let uploaded = self.remote.upload_or_update(&virtual_path, &path).await?;
+        let uploaded = self.remote.upload_or_update(&virtual_path, &path)?;
 
         self.db.upsert(&FileState {
             local_path: path.clone(),
@@ -188,7 +187,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn handle_local_delete(&mut self, path: PathBuf) -> Result<()> {
+    fn handle_local_delete(&mut self, path: PathBuf) -> Result<()> {
         let records = self.db.list_by_local_prefix(&path)?;
         if records.is_empty() {
             debug!("delete ignored, no db record for {}", path.display());
@@ -219,7 +218,7 @@ impl SyncEngine {
             return Ok(());
         };
 
-        let Some(remote_meta) = self.remote.get_metadata(&virtual_path).await? else {
+        let Some(remote_meta) = self.remote.get_metadata(&virtual_path)? else {
             warn!("remote upsert event had no metadata: {}", virtual_path);
             return Ok(());
         };
@@ -246,7 +245,6 @@ impl SyncEngine {
             let conflicted_path = make_conflicted_copy_path(&local_path)?;
             self.remote
                 .download_to_local(&virtual_path, &conflicted_path)
-                .await
                 .with_context(|| {
                     format!(
                         "failed to store conflicted copy for {} at {}",
@@ -261,7 +259,7 @@ impl SyncEngine {
                 conflicted_path.display()
             );
 
-            let uploaded = self.remote.upload_or_update(&virtual_path, &local_path).await?;
+            let uploaded = self.remote.upload_or_update(&virtual_path, &local_path)?;
             let local_timestamp = modified_unix_timestamp(&local_path)?;
 
             self.db.upsert(&FileState {
@@ -276,7 +274,7 @@ impl SyncEngine {
             return Ok(());
         }
 
-        let downloaded = self.remote.download_to_local(&virtual_path, &local_path).await?;
+        let downloaded = self.remote.download_to_local(&virtual_path, &local_path)?;
         let local_timestamp = modified_unix_timestamp(&local_path)?;
 
         self.db.upsert(&FileState {
@@ -297,7 +295,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn handle_remote_delete(&mut self, virtual_path: String) -> Result<()> {
+    fn handle_remote_delete(&mut self, virtual_path: String) -> Result<()> {
         let records = self.db.list_by_remote_prefix(&virtual_path)?;
 
         if records.is_empty() {
@@ -369,13 +367,13 @@ impl SyncEngine {
             }
         }
 
-        self.flush_expired_pending_deletes().await?;
+        self.flush_expired_pending_deletes()?;
 
         info!("manual sync finished");
         Ok(())
     }
 
-    async fn flush_expired_pending_deletes(&mut self) -> Result<()> {
+    fn flush_expired_pending_deletes(&mut self) -> Result<()> {
         let now = Instant::now();
 
         let expired = self
@@ -389,7 +387,7 @@ impl SyncEngine {
                 continue;
             };
 
-            self.remote.trash(&pending.record.virtual_remote_path).await?;
+            self.remote.trash(&pending.record.virtual_remote_path)?;
             self.db.remove_by_local_path(&pending.record.local_path)?;
 
             info!(
@@ -402,11 +400,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn flush_all_pending_deletes(&mut self) -> Result<()> {
+    fn flush_all_pending_deletes(&mut self) -> Result<()> {
         for pending in self.pending_deletes.values_mut() {
             pending.expires_at = Instant::now();
         }
-        self.flush_expired_pending_deletes().await
+        self.flush_expired_pending_deletes()
     }
 
     fn find_pending_delete_with_hash(

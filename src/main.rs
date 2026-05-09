@@ -22,7 +22,7 @@ use crate::app_paths::AppPaths;
 use crate::config::AppConfig;
 use crate::events::SyncEvent;
 use crate::meta::{OPERATING_SYSTEM, PROGRAMMING_LANGUAGE, PROJECT_NAME};
-use crate::remote::{GoogleDriveRemoteStore, RemoteStore};
+use crate::remote::{FsRemoteStore, RemoteStore};
 use crate::state_db::StateDb;
 use crate::sync_engine::SyncEngine;
 
@@ -70,17 +70,13 @@ async fn main() -> Result<()> {
 
     let db = StateDb::open(&paths.db_file)?;
 
-    let remote_backend: Arc<dyn RemoteStore> = Arc::new(
-        GoogleDriveRemoteStore::new(
-            &paths.credentials_file,
-            &paths.token_cache_file,
-            config.remote_target_folder.clone(),
-            Some(paths.db_file.clone()),
-        )
-        .await?,
-    );
+    let remote_sandbox_dir = paths.remote_sandbox_dir(&config.remote_target_folder);
+    let remote_backend: Arc<dyn RemoteStore> = Arc::new(FsRemoteStore::new(
+        remote_sandbox_dir,
+        paths.remote_trash_dir.clone(),
+    )?);
 
-    remote_backend.ensure_sandbox().await?;
+    remote_backend.ensure_sandbox()?;
 
     let (tx, rx) = mpsc::channel::<SyncEvent>(1024);
     let shutdown = CancellationToken::new();
