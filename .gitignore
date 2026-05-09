@@ -3,6 +3,3 @@ architecture.md
 session.md
 userflow.md
 .pi
-credentials.json
-token_cache.json
-*.json

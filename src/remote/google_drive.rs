@@ -129,6 +129,7 @@ impl GoogleDriveRemoteStore {
                 .q(&query)
                 .spaces("drive")
                 .param("fields", "files(id,name,parents)")
+                .param("pageSize", "10")
                 .add_scope(DRIVE_SCOPE)
                 .doit()
                 .await
@@ -219,6 +220,7 @@ impl GoogleDriveRemoteStore {
             .q(&query)
             .spaces("drive")
             .param("fields", "files(id,name,parents)")
+            .param("pageSize", "10")
             .add_scope(DRIVE_SCOPE)
             .doit()
             .await
@@ -297,6 +299,7 @@ impl GoogleDriveRemoteStore {
                 .q(&query)
                 .spaces("drive")
                 .param("fields", "files(id,name,parents)")
+                .param("pageSize", "1")
                 .add_scope(DRIVE_SCOPE)
                 .doit()
                 .await
@@ -324,6 +327,7 @@ impl GoogleDriveRemoteStore {
             .q(&query)
             .spaces("drive")
             .param("fields", "files(id,name,parents,mimeType,md5Checksum,modifiedTime,trashed)")
+            .param("pageSize", "1")
             .add_scope(DRIVE_SCOPE)
             .doit()
             .await
