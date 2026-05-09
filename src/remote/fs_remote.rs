@@ -113,7 +113,7 @@ impl RemoteStore for FsRemoteStore {
 
         let normalized = normalize_virtual_path(virtual_path);
         let target = self.absolute_from_virtual(&normalized)?;
-        let sandbox = self.sandbox_root.clone();
+        let _sandbox = self.sandbox_root.clone();
 
         let local = local_path.to_path_buf();
         let target_copy = target.clone();
