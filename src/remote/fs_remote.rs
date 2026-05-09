@@ -1,34 +1,27 @@
-use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
-use walkdir::WalkDir;
-
 use crate::events::{RemoteChange, RemoteFileMeta};
 use crate::hash_utils::{compute_md5, modified_rfc3339};
-
-use super::RemoteStore;
+use crate::remote::RemoteStore;
+use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::task;
+use uuid::Uuid;
+use walkdir::WalkDir;
 
 pub struct FsRemoteStore {
     sandbox_root: PathBuf,
     trash_root: PathBuf,
-    snapshot_hashes: Mutex<HashMap<String, String>>,
+    snapshot_hashes: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl FsRemoteStore {
     pub fn new(sandbox_root: PathBuf, trash_root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&sandbox_root)
-            .with_context(|| format!("failed to create {}", sandbox_root.display()))?;
-        fs::create_dir_all(&trash_root)
-            .with_context(|| format!("failed to create {}", trash_root.display()))?;
-
         Ok(Self {
             sandbox_root,
             trash_root,
-            snapshot_hashes: Mutex::new(HashMap::new()),
+            snapshot_hashes: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -37,29 +30,11 @@ impl FsRemoteStore {
         Ok(self.sandbox_root.join(relative))
     }
 
-    fn metadata_for_virtual(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
-        let normalized = normalize_remote_path(virtual_path);
-        let absolute_path = self.absolute_from_virtual(&normalized)?;
-
-        if !absolute_path.exists() || absolute_path.is_dir() {
-            return Ok(None);
-        }
-
-        let md5_hash = compute_md5(&absolute_path)?;
-        let modified_time = modified_rfc3339(&absolute_path)?;
-
-        Ok(Some(RemoteFileMeta {
-            drive_id: make_drive_id(&normalized),
-            virtual_path: normalized,
-            md5_hash,
-            modified_time,
-        }))
-    }
-
-    fn scan_files(&self) -> Result<HashMap<String, RemoteFileMeta>> {
+    fn scan_files_sync(&self) -> Result<HashMap<String, RemoteFileMeta>> {
         let mut out = HashMap::new();
+        let sandbox = self.sandbox_root.clone();
 
-        for entry in WalkDir::new(&self.sandbox_root)
+        for entry in WalkDir::new(&sandbox)
             .into_iter()
             .filter_map(std::result::Result::ok)
         {
@@ -69,16 +44,10 @@ impl FsRemoteStore {
 
             let absolute_path = entry.path();
             let relative = absolute_path
-                .strip_prefix(&self.sandbox_root)
-                .with_context(|| {
-                    format!(
-                        "failed to strip {} from {}",
-                        self.sandbox_root.display(),
-                        absolute_path.display()
-                    )
-                })?;
+                .strip_prefix(&sandbox)
+                .context("failed to strip sandbox prefix")?;
 
-            let virtual_path = normalize_remote_path(&relative.to_string_lossy());
+            let virtual_path = normalize_virtual_path(&relative.to_string_lossy());
             let md5_hash = compute_md5(absolute_path)?;
             let modified_time = modified_rfc3339(absolute_path)?;
 
@@ -95,16 +64,43 @@ impl FsRemoteStore {
 
         Ok(out)
     }
+
+    fn metadata_sync(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
+        let normalized = normalize_virtual_path(virtual_path);
+        let absolute_path = self.absolute_from_virtual(&normalized)?;
+
+        if !absolute_path.exists() || absolute_path.is_dir() {
+            return Ok(None);
+        }
+
+        let md5_hash = compute_md5(&absolute_path)?;
+        let modified_time = modified_rfc3339(&absolute_path)?;
+
+        Ok(Some(RemoteFileMeta {
+            drive_id: make_drive_id(&normalized),
+            virtual_path: normalized,
+            md5_hash,
+            modified_time,
+        }))
+    }
 }
 
+#[async_trait::async_trait]
 impl RemoteStore for FsRemoteStore {
-    fn ensure_sandbox(&self) -> Result<()> {
-        fs::create_dir_all(&self.sandbox_root)
-            .with_context(|| format!("failed to create {}", self.sandbox_root.display()))?;
-        Ok(())
+    async fn ensure_sandbox(&self) -> Result<()> {
+        let sandbox = self.sandbox_root.clone();
+        task::spawn_blocking(move || {
+            std::fs::create_dir_all(&sandbox)
+                .with_context(|| format!("failed to create sandbox {}", sandbox.display()))
+        })
+        .await?
     }
 
-    fn upload_or_update(&self, virtual_path: &str, local_path: &Path) -> Result<RemoteFileMeta> {
+    async fn upload_or_update(
+        &self,
+        virtual_path: &str,
+        local_path: &Path,
+    ) -> Result<RemoteFileMeta> {
         if !local_path.exists() {
             bail!("local path does not exist: {}", local_path.display());
         }
@@ -115,84 +111,107 @@ impl RemoteStore for FsRemoteStore {
             );
         }
 
-        let normalized = normalize_remote_path(virtual_path);
+        let normalized = normalize_virtual_path(virtual_path);
         let target = self.absolute_from_virtual(&normalized)?;
+        let sandbox = self.sandbox_root.clone();
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let local = local_path.to_path_buf();
+        let target_copy = target.clone();
 
-        fs::copy(local_path, &target).with_context(|| {
-            format!(
-                "failed to copy {} -> {}",
-                local_path.display(),
-                target.display()
-            )
-        })?;
+        task::spawn_blocking(move || {
+            if let Some(parent) = target_copy.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::copy(&local, &target_copy).with_context(|| {
+                format!(
+                    "failed to copy {} -> {}",
+                    local.display(),
+                    target_copy.display()
+                )
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
 
-        self.metadata_for_virtual(&normalized)?
+        self.metadata_sync(&normalized)?
             .context("metadata not available after upload")
     }
 
-    fn download_to_local(&self, virtual_path: &str, local_path: &Path) -> Result<RemoteFileMeta> {
-        let normalized = normalize_remote_path(virtual_path);
+    async fn download_to_local(
+        &self,
+        virtual_path: &str,
+        local_path: &Path,
+    ) -> Result<RemoteFileMeta> {
+        let normalized = normalize_virtual_path(virtual_path);
         let source = self.absolute_from_virtual(&normalized)?;
 
         if !source.exists() {
-            bail!("remote file does not exist: {}", normalized);
+            bail!("remote file does not exist: {normalized}");
         }
         if source.is_dir() {
             bail!("download_to_local only supports files, got directory {normalized}");
         }
 
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let dest = local_path.to_path_buf();
+        let source_copy = source.clone();
 
-        fs::copy(&source, local_path).with_context(|| {
-            format!(
-                "failed to copy {} -> {}",
-                source.display(),
-                local_path.display()
-            )
-        })?;
+        task::spawn_blocking(move || {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::copy(&source_copy, &dest).with_context(|| {
+                format!(
+                    "failed to copy {} -> {}",
+                    source_copy.display(),
+                    dest.display()
+                )
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
 
-        self.metadata_for_virtual(&normalized)?
+        self.metadata_sync(&normalized)?
             .context("metadata not available after download")
     }
 
-    fn rename(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<RemoteFileMeta> {
-        let from_normalized = normalize_remote_path(from_virtual_path);
-        let to_normalized = normalize_remote_path(to_virtual_path);
+    async fn rename(
+        &self,
+        from_virtual_path: &str,
+        to_virtual_path: &str,
+    ) -> Result<RemoteFileMeta> {
+        let from_normalized = normalize_virtual_path(from_virtual_path);
+        let to_normalized = normalize_virtual_path(to_virtual_path);
 
         let from_abs = self.absolute_from_virtual(&from_normalized)?;
         let to_abs = self.absolute_from_virtual(&to_normalized)?;
 
         if !from_abs.exists() {
-            bail!("remote source does not exist: {}", from_normalized);
+            bail!("remote source does not exist: {from_normalized}");
         }
 
-        if let Some(parent) = to_abs.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let from_clone = from_abs.clone();
+        let to_clone = to_abs.clone();
 
-        fs::rename(&from_abs, &to_abs).with_context(|| {
-            format!(
-                "failed to rename {} -> {}",
-                from_abs.display(),
-                to_abs.display()
-            )
-        })?;
+        task::spawn_blocking(move || {
+            if let Some(parent) = to_clone.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::rename(&from_clone, &to_clone).with_context(|| {
+                format!("failed to rename {} -> {}", from_clone.display(), to_clone.display())
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
 
-        self.metadata_for_virtual(&to_normalized)?
+        self.metadata_sync(&to_normalized)?
             .context("metadata not available after rename")
     }
 
-    fn trash(&self, virtual_path: &str) -> Result<()> {
-        let normalized = normalize_remote_path(virtual_path);
+    async fn trash(&self, virtual_path: &str) -> Result<()> {
+        let normalized = normalize_virtual_path(virtual_path);
         let source = self.absolute_from_virtual(&normalized)?;
 
         if !source.exists() {
@@ -207,31 +226,59 @@ impl RemoteStore for FsRemoteStore {
         let safe_name = normalized.replace('/', "__");
         let target = self.trash_root.join(format!("{ts}_{safe_name}"));
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let source_clone = source.clone();
+        let target_clone = target.clone();
 
-        fs::rename(&source, &target).with_context(|| {
-            format!(
-                "failed to move remote file to trash {} -> {}",
-                source.display(),
-                target.display()
-            )
-        })?;
-
-        Ok(())
+        task::spawn_blocking(move || {
+            if let Some(parent) = target_clone.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::rename(&source_clone, &target_clone).with_context(|| {
+                format!(
+                    "failed to move remote file to trash {} -> {}",
+                    source_clone.display(),
+                    target_clone.display()
+                )
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
     }
 
-    fn poll_changes(&self) -> Result<Vec<RemoteChange>> {
-        let current = self.scan_files()?;
+    async fn poll_changes(&self) -> Result<Vec<RemoteChange>> {
+        let sandbox = self.sandbox_root.clone();
+        let snapshot = Arc::new(std::sync::Mutex::new(
+            self.snapshot_hashes.lock().unwrap().clone()
+        ));
+        let snapshot_ref = Arc::clone(&snapshot);
 
-        let mut snapshot = self
-            .snapshot_hashes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("remote snapshot mutex poisoned"))?;
+        let current = task::spawn_blocking(move || {
+            let mut out = HashMap::new();
+            for entry in WalkDir::new(&sandbox)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let absolute_path = entry.path();
+                let relative = absolute_path.strip_prefix(&sandbox)
+                    .context("failed to strip sandbox prefix")?;
+                let virtual_path = normalize_virtual_path(&relative.to_string_lossy());
+                let md5_hash = compute_md5(absolute_path)?;
+                let modified_time = modified_rfc3339(absolute_path)?;
+                out.insert(virtual_path.clone(), RemoteFileMeta {
+                    drive_id: make_drive_id(&virtual_path),
+                    virtual_path,
+                    md5_hash,
+                    modified_time,
+                });
+            }
+            Ok::<_, anyhow::Error>(out)
+        }).await??;
 
-        let previous = snapshot.clone();
+        let previous = snapshot_ref.lock().unwrap().clone();
         let mut changes = Vec::new();
 
         for (path, meta) in &current {
@@ -249,22 +296,59 @@ impl RemoteStore for FsRemoteStore {
             }
         }
 
-        *snapshot = current
+        let updates: HashMap<String, String> = current
             .iter()
-            .map(|(path, meta)| (path.clone(), meta.md5_hash.clone()))
+            .map(|(p, m)| (p.clone(), m.md5_hash.clone()))
             .collect();
 
+        *self.snapshot_hashes.lock().unwrap() = updates;
         Ok(changes)
     }
 
-    fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
-        self.metadata_for_virtual(virtual_path)
+async fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
+        let normalized = normalize_virtual_path(virtual_path);
+        let sandbox = self.sandbox_root.clone();
+
+        task::spawn_blocking(move || {
+            for entry in WalkDir::new(&sandbox)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let absolute_path = entry.path();
+                let relative = absolute_path.strip_prefix(&sandbox)
+                    .context("failed to strip sandbox prefix")?;
+                let vp = normalize_virtual_path(&relative.to_string_lossy());
+                if vp == normalized {
+                    let md5_hash = compute_md5(absolute_path)?;
+                    let modified_time = modified_rfc3339(absolute_path)?;
+                    return Ok(Some(RemoteFileMeta {
+                        drive_id: make_drive_id(&vp),
+                        virtual_path: vp,
+                        md5_hash,
+                        modified_time,
+                    }));
+                }
+            }
+            Ok(None)
+        }).await?
     }
+}
+
+fn normalize_virtual_path(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('/')
+        .replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn sanitize_virtual_path(raw: &str) -> Result<PathBuf> {
     let mut out = PathBuf::new();
-
     for component in Path::new(raw).components() {
         match component {
             Component::Normal(segment) => out.push(segment),
@@ -272,21 +356,10 @@ fn sanitize_virtual_path(raw: &str) -> Result<PathBuf> {
             _ => bail!("invalid remote path component in {raw}"),
         }
     }
-
     if out.as_os_str().is_empty() {
         bail!("remote path cannot be empty");
     }
-
     Ok(out)
-}
-
-fn normalize_remote_path(raw: &str) -> String {
-    raw.trim_matches('/')
-        .replace('\\', "/")
-        .split('/')
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn make_drive_id(virtual_path: &str) -> String {

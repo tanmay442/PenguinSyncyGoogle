@@ -3,3 +3,7 @@ architecture.md
 session.md
 userflow.md
 .pi
+clientsecret.json
+credentials.json
+*.log
+*.env

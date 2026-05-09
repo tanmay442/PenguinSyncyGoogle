@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct FileState {
@@ -25,6 +26,7 @@ impl StateDb {
 
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db at {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
 
         let db = Self { conn };
         db.init_schema()?;
@@ -48,6 +50,14 @@ impl StateDb {
 
             CREATE INDEX IF NOT EXISTS idx_file_state_md5
             ON file_state(md5_hash);
+
+            CREATE INDEX IF NOT EXISTS idx_file_state_drive_id
+            ON file_state(drive_id);
+
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             "#,
         )?;
 
@@ -112,6 +122,19 @@ impl StateDb {
                 row_to_file_state,
             )
             .optional()?;
+
+        Ok(row)
+    }
+
+    pub fn get_by_drive_id(&self, drive_id: &str) -> Result<Option<FileState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT local_path, drive_id, virtual_remote_path, md5_hash, local_timestamp, remote_timestamp
+             FROM file_state
+             WHERE drive_id = ?1
+             LIMIT 1",
+        )?;
+
+        let row = stmt.query_row(params![drive_id], row_to_file_state).optional()?;
 
         Ok(row)
     }
@@ -183,6 +206,29 @@ impl StateDb {
         self.conn.execute(
             "UPDATE file_state SET local_timestamp = ?2 WHERE local_path = ?1",
             params![normalize_local_path(local_path), local_timestamp],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM sync_meta WHERE key = ?1")?;
+
+        let value = stmt.query_row(params![key], |row| row.get(0)).optional()?;
+        Ok(value)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO sync_meta (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value
+            "#,
+            params![key, value],
         )?;
 
         Ok(())
