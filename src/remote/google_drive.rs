@@ -20,6 +20,27 @@ const DRIVE_FILE_LIST_FIELDS: &str = "files(id,name,parents,mimeType,md5Checksum
 const DRIVE_CHANGE_FIELDS: &str = "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file(id,name,parents,mimeType,md5Checksum,modifiedTime,trashed))";
 const PAGE_TOKEN_KEY: &str = "google_drive_page_token";
 
+const GOOGLE_DOCUMENT_EXPORT: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const GOOGLE_SPREADSHEET_EXPORT: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const GOOGLE_PRESENTATION_EXPORT: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const GOOGLE_DRAWING_EXPORT: &str = "image/png";
+const GOOGLE_SCRIPT_EXPORT: &str = "application/vnd.google-apps.script+json";
+
+fn google_apps_mime_to_export_mime(mime: &str) -> Option<(&'static str, &'static str)> {
+    match mime {
+        "application/vnd.google-apps.document" => Some((GOOGLE_DOCUMENT_EXPORT, ".docx")),
+        "application/vnd.google-apps.spreadsheet" => Some((GOOGLE_SPREADSHEET_EXPORT, ".xlsx")),
+        "application/vnd.google-apps.presentation" => Some((GOOGLE_PRESENTATION_EXPORT, ".pptx")),
+        "application/vnd.google-apps.drawing" => Some((GOOGLE_DRAWING_EXPORT, ".png")),
+        "application/vnd.google-apps.script" => Some((GOOGLE_SCRIPT_EXPORT, ".json")),
+        _ => None,
+    }
+}
+
+fn is_google_apps_mime(mime: &str) -> bool {
+    mime.starts_with("application/vnd.google-apps") && mime != FOLDER_MIME_TYPE
+}
+
 type HttpConnector = hyper_util::client::legacy::connect::HttpConnector;
 type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 type GoogleDriveHub = DriveHub<HttpsConnector>;
@@ -382,11 +403,18 @@ impl GoogleDriveRemoteStore {
             .map(chrono::DateTime::to_rfc3339)
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
+        let mime_type = file.mime_type.clone();
+        let google_export_ext = mime_type
+            .as_deref()
+            .and_then(|m| google_apps_mime_to_export_mime(m).map(|(_, ext)| ext.to_string()));
+
         Ok(RemoteFileMeta {
             drive_id,
             virtual_path,
             md5_hash: file.md5_checksum.clone().unwrap_or_default(),
             modified_time,
+            mime_type,
+            google_export_ext,
         })
     }
 
@@ -396,49 +424,97 @@ impl GoogleDriveRemoteStore {
             _ => return Ok(None),
         };
 
-        let sandbox_id = self.ensure_sandbox_id().await?;
-        let mut segments = vec![file_name];
-        let mut parent_id = file
-            .parents
-            .as_ref()
-            .and_then(|parents| parents.first().cloned());
+        let sandbox_id = match self.ensure_sandbox_id().await {
+            Ok(id) => id,
+            Err(err) => {
+                debug!("could not get sandbox id for path resolution: {err:#}");
+                return Ok(None);
+            }
+        };
 
+        let parent_ids: Vec<String> = file.parents.clone().unwrap_or_default();
+        if parent_ids.is_empty() {
+            debug!("file '{}' has no parents, cannot determine virtual path", file_name);
+            return Ok(None);
+        }
+
+        let first_parent = &parent_ids[0];
+        let mut segments: Vec<String> = Vec::new();
+        let mut current_parent_id = first_parent.clone();
         let mut visited = HashSet::new();
-        let mut reached_sandbox = false;
 
-        while let Some(current_parent_id) = parent_id {
-            if current_parent_id == sandbox_id {
-                reached_sandbox = true;
+        visited.insert(current_parent_id.clone());
+
+        while current_parent_id != sandbox_id {
+            if visited.contains(&current_parent_id) {
+                debug!("cycle detected in parent hierarchy for file '{}'", file_name);
+                if segments.is_empty() {
+                    return Ok(None);
+                }
                 break;
             }
 
-            if !visited.insert(current_parent_id.clone()) {
-                return Ok(None);
-            }
+            visited.insert(current_parent_id.clone());
 
-            let Some(parent) = self.get_file_by_id(&current_parent_id).await? else {
-                return Ok(None);
+            let parent = match self.get_file_by_id(&current_parent_id).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    debug!(
+                        "parent {} not found while resolving path for file '{}', using partial path",
+                        current_parent_id, file_name
+                    );
+                    if segments.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                Err(err) => {
+                    debug!(
+                        "error fetching parent {} for file '{}': {err:#}",
+                        current_parent_id, file_name
+                    );
+                    if segments.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
             };
 
             if parent.trashed.unwrap_or(false) {
+                debug!("parent {} is trashed, skipping", current_parent_id);
                 return Ok(None);
             }
 
             let Some(parent_name) = parent.name else {
+                debug!("parent {} has no name, skipping", current_parent_id);
                 return Ok(None);
             };
 
-            segments.push(parent_name);
-            parent_id = parent.parents.and_then(|mut p| p.drain(..).next());
-        }
+            if parent.mime_type.as_deref() == Some(FOLDER_MIME_TYPE) {
+                segments.push(parent_name);
+            } else if current_parent_id == sandbox_id {
+                break;
+            }
 
-        if !reached_sandbox {
-            return Ok(None);
+            match parent.parents.and_then(|mut p| p.drain(..).next()) {
+                Some(next_id) => current_parent_id = next_id,
+                None => break,
+            }
         }
 
         segments.reverse();
-        let normalized = normalize_virtual_path(&segments.join("/"));
+        let first_segment_is_file = !segments.is_empty() && segments[0] == file_name;
+        segments.push(file_name);
 
+        if first_segment_is_file && first_parent == &sandbox_id {
+            return Ok(Some(segments[1..].join("/")));
+        }
+
+        if first_segment_is_file && segments.len() == 1 {
+            return Ok(None);
+        }
+
+        let normalized = normalize_virtual_path(&segments.join("/"));
         if normalized.is_empty() {
             return Ok(None);
         }
@@ -465,7 +541,23 @@ impl GoogleDriveRemoteStore {
             }
 
             removed_or_trashed |= file.trashed.unwrap_or(false);
-            mapped_path = self.virtual_path_from_file(file).await?;
+            match self.virtual_path_from_file(file).await {
+                Ok(Some(path)) => mapped_path = Some(path),
+                Ok(None) => {
+                    let file_name = file.name.as_deref().unwrap_or("unknown");
+                    if let Some(ref fid) = file_id {
+                        warn!("Drive file '{}' (id={}) is inside sandbox but path resolution returned no path; skipping", file_name, fid);
+                    }
+                }
+                Err(err) => {
+                    if let Some(ref fid) = file_id {
+                        warn!("error resolving virtual path for file id {}: {err:#}", fid);
+                    }
+                    mapped_path = file_id.as_ref().and_then(|id| {
+                        self.lookup_virtual_path_by_drive_id(id).ok().flatten()
+                    });
+                }
+            }
         }
 
         if removed_or_trashed {
@@ -620,19 +712,37 @@ impl RemoteStore for GoogleDriveRemoteStore {
             .clone()
             .context("Drive download target missing file id")?;
 
-        let (response, _) = self
-            .hub
-            .files()
-            .get(&file_id)
-            .supports_all_drives(true)
-            .param("alt", "media")
-            .doit()
-            .await
-            .with_context(|| format!("failed Drive download for {normalized}"))?;
+        let mime_type = file.mime_type.as_deref().unwrap_or_default();
+        let bytes = if is_google_apps_mime(mime_type) {
+            let Some((export_mime, _)) = google_apps_mime_to_export_mime(mime_type) else {
+                bail!("unsupported Google Workspace format: {mime_type}");
+            };
+            debug!("exporting Google Workspace file {} as {}", file_id, export_mime);
+            let response = self
+                .hub
+                .files()
+                .export(&file_id, export_mime)
+                .doit()
+                .await
+                .with_context(|| format!("failed Drive export for {normalized} ({mime_type})"))?;
+            common::to_bytes(response.into_body())
+                .await
+                .ok_or_else(|| anyhow!("Drive export returned empty body for {normalized}"))?
+        } else {
+            let (response, _) = self
+                .hub
+                .files()
+                .get(&file_id)
+                .supports_all_drives(true)
+                .param("alt", "media")
+                .doit()
+                .await
+                .with_context(|| format!("failed Drive download for {normalized}"))?;
 
-        let bytes = common::to_bytes(response.into_body())
-            .await
-            .ok_or_else(|| anyhow!("Drive download returned empty body for {normalized}"))?;
+            common::to_bytes(response.into_body())
+                .await
+                .ok_or_else(|| anyhow!("Drive download returned empty body for {normalized}"))?
+        };
 
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent)

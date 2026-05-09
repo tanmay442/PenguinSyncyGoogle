@@ -32,4 +32,6 @@ pub struct RemoteFileMeta {
     pub virtual_path: String,
     pub md5_hash: String,
     pub modified_time: String,
+    pub mime_type: Option<String>,
+    pub google_export_ext: Option<String>,
 }

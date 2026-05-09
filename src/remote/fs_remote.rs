@@ -30,44 +30,12 @@ impl FsRemoteStore {
         Ok(self.sandbox_root.join(relative))
     }
 
-    fn scan_files_sync(&self) -> Result<HashMap<String, RemoteFileMeta>> {
-        let mut out = HashMap::new();
-        let sandbox = self.sandbox_root.clone();
-
-        for entry in WalkDir::new(&sandbox)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let absolute_path = entry.path();
-            let relative = absolute_path
-                .strip_prefix(&sandbox)
-                .context("failed to strip sandbox prefix")?;
-
-            let virtual_path = normalize_virtual_path(&relative.to_string_lossy());
-            let md5_hash = compute_md5(absolute_path)?;
-            let modified_time = modified_rfc3339(absolute_path)?;
-
-            out.insert(
-                virtual_path.clone(),
-                RemoteFileMeta {
-                    drive_id: make_drive_id(&virtual_path),
-                    virtual_path,
-                    md5_hash,
-                    modified_time,
-                },
-            );
-        }
-
-        Ok(out)
-    }
-
     fn metadata_sync(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
         let normalized = normalize_virtual_path(virtual_path);
-        let absolute_path = self.absolute_from_virtual(&normalized)?;
+        let absolute_path = match self.absolute_from_virtual(&normalized) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
 
         if !absolute_path.exists() || absolute_path.is_dir() {
             return Ok(None);
@@ -81,6 +49,8 @@ impl FsRemoteStore {
             virtual_path: normalized,
             md5_hash,
             modified_time,
+            mime_type: None,
+            google_export_ext: None,
         }))
     }
 }
@@ -113,7 +83,6 @@ impl RemoteStore for FsRemoteStore {
 
         let normalized = normalize_virtual_path(virtual_path);
         let target = self.absolute_from_virtual(&normalized)?;
-        let _sandbox = self.sandbox_root.clone();
 
         let local = local_path.to_path_buf();
         let target_copy = target.clone();
@@ -273,6 +242,8 @@ impl RemoteStore for FsRemoteStore {
                     virtual_path,
                     md5_hash,
                     modified_time,
+                    mime_type: None,
+                    google_export_ext: None,
                 });
             }
             Ok::<_, anyhow::Error>(out)
@@ -305,7 +276,7 @@ impl RemoteStore for FsRemoteStore {
         Ok(changes)
     }
 
-async fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
+    async fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta>> {
         let normalized = normalize_virtual_path(virtual_path);
         let sandbox = self.sandbox_root.clone();
 
@@ -329,6 +300,8 @@ async fn get_metadata(&self, virtual_path: &str) -> Result<Option<RemoteFileMeta
                         virtual_path: vp,
                         md5_hash,
                         modified_time,
+                        mime_type: None,
+                        google_export_ext: None,
                     }));
                 }
             }
